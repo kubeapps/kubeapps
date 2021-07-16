@@ -15,7 +15,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"math"
 	"os"
 	"strconv"
 	"sync"
@@ -36,10 +35,10 @@ type ResourceWatcherCache struct {
 	// these expected to be provided by the caller when creating new cache
 	config cacheConfig
 	// internal state: prevent multiple watchers
-	watcherStarted bool
+	initOk bool
 	// internal state: this mutex guards watcherStarted var
-	watcherMutex sync.Mutex
-	redisCli     *redis.Client
+	initMutex sync.Mutex
+	redisCli  *redis.Client
 	// this WaitGroup is used exclusively by unit tests to block until all expected objects have
 	// been 'processed' by the go routine running in the background. The creation of the WaitGroup object
 	// and to call to .Add() is expected to be done by the unit test client. The server-side only signals
@@ -55,6 +54,8 @@ type cacheConfig struct {
 	// 'onAdd' and 'onModify' hooks are called when a new or modified object comes about and
 	// allows the plug-in to return information about WHETHER OR NOT and WHAT is to be stored
 	// in the cache for a given k8s object (passed in as a untyped/unstructured map)
+	// the list of types actually supported be redis you can find in
+	// https://github.com/go-redis/redis/blob/v8.10.0/internal/proto/writer.go#L61
 	onAdd    func(string, map[string]interface{}) (interface{}, bool, error)
 	onModify func(string, map[string]interface{}) (interface{}, bool, error)
 	// the semantics of 'onGet' hook is to convert or "reverse engineer" what was previously
@@ -122,35 +123,41 @@ func newCacheWithRedisClient(config cacheConfig, redisCli *redis.Client) (*Resou
 	log.Infof("[PING] -> [%s]", pong)
 
 	c := ResourceWatcherCache{
-		config:         config,
-		watcherStarted: false,
-		watcherMutex:   sync.Mutex{},
-		redisCli:       redisCli,
+		config:    config,
+		redisCli:  redisCli,
+		initOk:    false,
+		initMutex: sync.Mutex{},
 	}
+
+	c.initMutex.Lock()
 	go c.startResourceWatcher()
 	return &c, nil
 }
 
 func (c *ResourceWatcherCache) startResourceWatcher() {
 	log.Infof("+ResourceWatcherCache startResourceWatcher")
-	c.watcherMutex.Lock()
-	// can't defer c.watcherMutex.Unlock() because when all is well,
+	// can't defer c.initMutex.Unlock() because when all is well,
 	// we never return from this func
 
-	if !c.watcherStarted {
-		ch, err := c.newResourceWatcherChan()
-		if err != nil {
-			c.watcherMutex.Unlock()
-			log.Errorf("failed to start resource watcher due to: %v", err)
-			return
-		}
-		c.watcherStarted = true
-		c.watcherMutex.Unlock()
-		log.Infof("watcher for [%s] successfully started. waiting for events...", c.config.gvr)
+	if !c.initOk {
+		for {
+			ch, err := c.newResourceWatcherChan()
+			if err != nil {
+				c.initMutex.Unlock()
+				log.Errorf("Failed to start resource watcher for [%s] due to: %v", c.config.gvr, err)
+				return
+			}
+			c.initOk = true
+			c.initMutex.Unlock()
+			log.Infof("Watcher for [%s] successfully started. waiting for events...", c.config.gvr)
 
-		c.processEvents(ch)
+			c.processEvents(ch)
+			// if we get here the watch needs to be re-started
+			c.initMutex.Lock()
+			c.initOk = false
+		}
 	} else {
-		c.watcherMutex.Unlock()
+		c.initMutex.Unlock()
 		log.Infof("watcher already started. exiting...")
 	}
 	// we should never reach here under normal usage
@@ -166,6 +173,12 @@ func (c *ResourceWatcherCache) newResourceWatcherChan() (<-chan watch.Event, err
 	}
 
 	// this will start a watcher on all namespaces
+	// notice, we are not setting resourceVersion in ListOptions, which means
+	// per https://kubernetes.io/docs/reference/using-api/api-concepts/
+	// Get State and Start at Most Recent: to establish initial state, the watch
+	// begins with synthetic "Added" events of all resources instances that exist
+	// at the starting resource version. All following watch events are for all changes
+	// that occurred after the resource version the watch started at
 	watcher, err := dynamicClient.Resource(c.config.gvr).Namespace("").Watch(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, err
@@ -177,12 +190,17 @@ func (c *ResourceWatcherCache) newResourceWatcherChan() (<-chan watch.Event, err
 // this is an infinite loop that waits for new events and processes them when they happen
 func (c *ResourceWatcherCache) processEvents(ch <-chan watch.Event) {
 	for {
-		event := <-ch
+		event, ok := <-ch
+		if !ok {
+			log.Errorf("Channel already closed. Will attempt to restart the watcher")
+			// this may happen and we will need to restart the watcher
+			return
+		}
 		if event.Type == "" {
 			// not quite sure why this happens (the docs don't say), but it seems to happen quite often
 			continue
 		}
-		log.Infof("got event: type: [%v] object:\n[%s]", event.Type, prettyPrintObject(event.Object))
+		log.Infof("Got event: type: [%v] object:\n[%s]", event.Type, prettyPrintObject(event.Object))
 		switch event.Type {
 		case watch.Added, watch.Modified, watch.Deleted:
 			unstructuredRepo, ok := event.Object.(*unstructured.Unstructured)
@@ -249,7 +267,7 @@ func (c *ResourceWatcherCache) onAddOrModify(add bool, unstructuredObj map[strin
 			log.Errorf("Failed to set value for object with key [%s] in cache due to: %v", *key, err)
 			return
 		} else {
-			log.Infof("set value for object with key [%s] in cache", *key)
+			log.Infof("Set value for object with key [%s] in cache", *key)
 		}
 	}
 }
@@ -310,76 +328,70 @@ func (c *ResourceWatcherCache) fetchForOne(key string) (interface{}, error) {
 	return val, nil
 }
 
-const (
-	// max number of concurrent workers reading results for fetch() at the same time
-	maxWorkers = 10
-)
-
-type fetchValueJob struct {
-	key string
-}
-
-type fetchValueJobResult struct {
-	result interface{}
-	err    error
-}
-
-// each object is read from redis in a separate go routine (lightweight thread of execution)
-// listItems is a list of unstructured objects.
-// TODO 1 (gfichtenholt) all we really need is the list of keys, so we should have a flavor of this func
-// that accepts that
-// TODO 2 (gfichtenholt) the result should really be a map[string]interface{}, i.e. map with keys
-// instead of []interface{}
-func (c *ResourceWatcherCache) fetchCachedObjects(requestItems []unstructured.Unstructured) ([]interface{}, error) {
-	responseItems := make([]interface{}, 0)
-	var wg sync.WaitGroup
-	numWorkers := int(math.Min(float64(len(requestItems)), float64(maxWorkers)))
-	requestChan := make(chan fetchValueJob, numWorkers)
-	responseChan := make(chan fetchValueJobResult, numWorkers)
-
-	// Process only at most maxWorkers at a time
-	for i := 0; i < numWorkers; i++ {
-		wg.Add(1)
-		go func() {
-			for job := range requestChan {
-				// The following loop will only terminate when the request channel is closed (and there are no more items)
-				result, err := c.fetchForOne(job.key)
-				responseChan <- fetchValueJobResult{result, err}
-			}
-			wg.Done()
-		}()
+// return all keys, optionally matching a given filter (repository list)
+// currently we're caching the index of a repo using the repo name as the key
+func (c *ResourceWatcherCache) listKeys(filters []string) ([]string, error) {
+	if err := c.checkInit(); err != nil {
+		return nil, err
 	}
-	go func() {
-		wg.Wait()
-		close(responseChan)
-	}()
+	// see https://github.com/redis/redis/issues/3627:
+	// 1) we don't want to use KEYS command
+	// 2) match pattern does not support 'OR'
+	// 3) simulate a HashSet in go to make sure we have no duplicates, as SCAN may
+	// return duplicates
+	redisKeys := map[string]struct{}{}
+	match := []string{""} // everything by default
 
-	go func() {
-		for _, item := range requestItems {
-			key, err := c.redisKeyFor(item.Object)
+	if len(filters) > 0 {
+		match = make([]string, len(filters))
+		for i, f := range filters {
+			match[i] = fmt.Sprintf("%s:*:%s", c.config.gvr.Resource, f)
+		}
+	}
+
+	for _, m := range match {
+		// https://redis.io/commands/scan An iteration starts when the cursor is set to 0,
+		// and terminates when the cursor returned by the server is 0
+		cursor := uint64(0)
+		for {
+			// glob-style pattern, you can use https://www.digitalocean.com/community/tools/glob to test
+			keys, cursor, err := c.redisCli.Scan(c.redisCli.Context(), cursor, m, 0).Result()
 			if err != nil {
-				log.Errorf("Failed to get redis key due to: %v", err)
-			} else {
-				requestChan <- fetchValueJob{*key}
+				return nil, err
 			}
-		}
-		close(requestChan)
-	}()
-
-	// Start receiving results
-	// The following loop will only terminate when the response channel is closed, i.e.
-	// after the all the requests have been processed
-	for resp := range responseChan {
-		if resp.err == nil {
-			// resp.result may be nil when there is a cache miss
-			if resp.result != nil {
-				responseItems = append(responseItems, resp.result)
+			log.Infof("listKeys: SCAN returned keys: %s, cursor: [%d]", keys, cursor)
+			for _, key := range keys {
+				redisKeys[key] = struct{}{}
 			}
-		} else {
-			log.Errorf("%v", resp.err)
+			if cursor == 0 {
+				break
+			}
 		}
 	}
-	return responseItems, nil
+
+	resultKeys := make([]string, len(redisKeys))
+	i := 0
+	for k := range redisKeys {
+		resultKeys[i] = k
+		i++
+	}
+	return resultKeys, nil
+}
+
+func (c *ResourceWatcherCache) fetchForMultiple(keys []string) (map[string]interface{}, error) {
+	if err := c.checkInit(); err != nil {
+		return nil, err
+	}
+
+	response := make(map[string]interface{})
+	for _, key := range keys {
+		result, err := c.fetchForOne(key)
+		if err != nil {
+			return nil, err
+		}
+		response[key] = result
+	}
+	return response, nil
 }
 
 // TODO (gfichtenholt) give the plug-ins the ability to override this (default) implementation
@@ -405,4 +417,19 @@ func (c *ResourceWatcherCache) redisKeyFor(unstructuredObj map[string]interface{
 	// We will use "helmrepository:ns:repoName"
 	s := fmt.Sprintf("%s:%s:%s", c.config.gvr.Resource, namespace, name)
 	return &s, nil
+}
+
+// this func is meant to be called to make sure cache client waits
+// for the cache to be fully initialized before attempting read the data out
+// of the cache
+func (c *ResourceWatcherCache) checkInit() error {
+	c.initMutex.Lock()
+	defer c.initMutex.Unlock()
+	if !c.initOk {
+		return status.Errorf(
+			codes.FailedPrecondition,
+			"server cache has not been properly initialized")
+	} else {
+		return nil
+	}
 }
